@@ -2,8 +2,36 @@
 // See LICENSE.txt for license details
 //
 // Pthread port of direction-optimizing BFS (see bfs.cc).
+//
+// This file is written to mirror, as closely as a hand port can, the code GCC
+// emits for the OpenMP kernel in bfs.cc:
+//
+//   * Each "#pragma omp parallel [for]" region becomes a dedicated worker
+//     function with the loop body written *inline* -- exactly like GCC's
+//     outlined `*._omp_fn.N` functions. Crucially the body is NOT reached
+//     through a per-iteration function pointer, so the compiler can inline the
+//     neighbourhood walk + bitmap probes and keep many independent memory
+//     accesses in flight (the high memory-level parallelism that saturates
+//     DRAM bandwidth in the bottom-up step).
+//   * Loop scheduling matches libgomp: BUStep uses dynamic/1024 via a shared
+//     atomic counter (GOMP_loop_nonmonotonic_dynamic), every other region uses
+//     the default static schedule with GOMP's exact even split.
+//   * Reductions accumulate into per-thread partials that main sums.
+//   * The persistent worker team is released/collected with a sense-reversing
+//     barrier that spins before sleeping, mirroring libgomp's barrier (glibc's
+//     pthread_barrier_wait goes to a futex sleep almost immediately, which adds
+//     wake-up latency to every one of the many small regions a BFS runs).
+
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE
+#endif
+
+#include <sched.h>
+#include <sys/syscall.h>
+#include <linux/futex.h>
 
 #include <atomic>
+#include <climits>
 #include <cstdlib>
 #include <iostream>
 #include <pthread.h>
@@ -40,8 +68,117 @@ static int GetNumThreads() {
 }
 
 
+// ---------------------------------------------------------------------------
+// Low-latency team synchronization (libgomp-style spin-then-sleep barrier).
+// ---------------------------------------------------------------------------
+
+static inline void CpuRelax() {
+#if defined(__x86_64__) || defined(__i386__)
+  __builtin_ia32_pause();
+#elif defined(__aarch64__)
+  __asm__ __volatile__("yield" ::: "memory");
+#else
+  sched_yield();
+#endif
+}
+
+static inline void FutexWait(int *addr, int expected) {
+  syscall(SYS_futex, addr, FUTEX_WAIT_PRIVATE, expected, nullptr, nullptr, 0);
+}
+
+static inline void FutexWakeAll(int *addr) {
+  syscall(SYS_futex, addr, FUTEX_WAKE_PRIVATE, INT_MAX, nullptr, nullptr, 0);
+}
+
+// Number of CPUs this process is actually allowed to run on (respects
+// taskset / numactl pinning), used to decide whether we are oversubscribed.
+static int AvailableCPUs() {
+  cpu_set_t set;
+  CPU_ZERO(&set);
+  if (sched_getaffinity(0, sizeof(set), &set) == 0) {
+    int n = CPU_COUNT(&set);
+    if (n > 0)
+      return n;
+  }
+  long n = sysconf(_SC_NPROCESSORS_ONLN);
+  return n > 0 ? static_cast<int>(n) : 1;
+}
+
+// Pick a spin count the way libgomp's env.c does:
+//   GOMP_SPINCOUNT (or our GAPBS_SPINCOUNT) overrides everything; otherwise the
+//   default is 300000, throttled to 100 when the team is oversubscribed.
+// We intentionally do NOT consult OMP_WAIT_POLICY: run_gapbs_perf.sh exports
+// OMP_WAIT_POLICY=passive only on the pthread path, which would force the team
+// to sleep and diverge from the OpenMP run (which uses the default policy).
+static long ComputeSpinCount(int num_threads) {
+  if (const char *s = getenv("GAPBS_SPINCOUNT")) {
+    long v = atol(s);
+    if (v >= 0)
+      return v;
+  }
+  if (const char *s = getenv("GOMP_SPINCOUNT")) {
+    long v = atol(s);
+    if (v >= 0)
+      return v;
+  }
+  const long kDefaultSpin = 300000;
+  const long kThrottledSpin = 100;
+  int avail = AvailableCPUs();
+  if (avail > 0 && num_threads > avail)
+    return kThrottledSpin;
+  return kDefaultSpin;
+}
+
+
+// Reusable centralized sense-reversing barrier for `participants` threads.
+// Spins up to `spin` iterations, then blocks on a futex. Drop-in for the
+// pthread_barrier_t the pool used before (same N+1 rendezvous semantics).
+class SpinBarrier {
+ public:
+  void init(int participants, long spin) {
+    total_ = participants;
+    spin_ = spin;
+    __atomic_store_n(&count_, 0, __ATOMIC_RELAXED);
+    __atomic_store_n(&phase_, 0, __ATOMIC_RELAXED);
+  }
+
+  void destroy() {}
+
+  void wait() {
+    int my_phase = __atomic_load_n(&phase_, __ATOMIC_RELAXED);
+    // ACQ_REL so the last arriver's read of `count_` happens-after every other
+    // thread's pre-barrier writes (RMW release sequence), giving full barrier
+    // ordering once we publish the phase flip below.
+    int arrived = __atomic_add_fetch(&count_, 1, __ATOMIC_ACQ_REL);
+    if (arrived == total_) {
+      __atomic_store_n(&count_, 0, __ATOMIC_RELAXED);
+      __atomic_store_n(&phase_, my_phase ^ 1, __ATOMIC_RELEASE);
+      FutexWakeAll(&phase_);
+    } else {
+      long spins = spin_;
+      while (__atomic_load_n(&phase_, __ATOMIC_ACQUIRE) == my_phase) {
+        if (spins > 0) {
+          spins--;
+          CpuRelax();
+        } else {
+          FutexWait(&phase_, my_phase);
+        }
+      }
+    }
+  }
+
+ private:
+  int total_ = 0;
+  long spin_ = 0;
+  int count_ = 0;   // arrivals this episode
+  int phase_ = 0;   // sense / futex word
+};
+
+
 /*
- * Persistent worker pool synchronized with pthread barriers (n workers + main).
+ * Persistent worker pool: n workers + main, released and collected with two
+ * barriers per region (mirrors libgomp's "wake team" + "end-of-parallel
+ * barrier"). Same control flow as before; only the barrier primitive changed.
  */
 class ThreadPool {
  public:
@@ -58,10 +195,11 @@ class ThreadPool {
       return;
     num_threads_ = num_threads;
     worker_self_ = this;
+    long spin = ComputeSpinCount(num_threads_);
+    job_start_.init(num_threads_ + 1, spin);
+    job_end_.init(num_threads_ + 1, spin);
     thread_ids_.resize(num_threads_);
     threads_.resize(num_threads_);
-    pthread_barrier_init(&job_start_, nullptr, num_threads_ + 1);
-    pthread_barrier_init(&job_end_, nullptr, num_threads_ + 1);
     for (int t = 0; t < num_threads_; t++) {
       thread_ids_[t] = t;
       pthread_create(&threads_[t], nullptr, WorkerMain, &thread_ids_[t]);
@@ -72,12 +210,12 @@ class ThreadPool {
     if (num_threads_ == 0)
       return;
     shutdown_ = true;
-    pthread_barrier_wait(&job_start_);
-    pthread_barrier_wait(&job_end_);
+    job_start_.wait();
+    job_end_.wait();
     for (int t = 0; t < num_threads_; t++)
       pthread_join(threads_[t], nullptr);
-    pthread_barrier_destroy(&job_start_);
-    pthread_barrier_destroy(&job_end_);
+    job_start_.destroy();
+    job_end_.destroy();
     num_threads_ = 0;
     threads_.clear();
     thread_ids_.clear();
@@ -88,8 +226,8 @@ class ThreadPool {
   void Run(void (*fn)(int, int, void *), void *ctx) {
     task_fn_ = fn;
     task_ctx_ = ctx;
-    pthread_barrier_wait(&job_start_);
-    pthread_barrier_wait(&job_end_);
+    job_start_.wait();
+    job_end_.wait();
     task_fn_ = nullptr;
     task_ctx_ = nullptr;
   }
@@ -103,21 +241,21 @@ class ThreadPool {
     int tid = *static_cast<int *>(arg);
     ThreadPool &pool = *worker_self_;
     while (true) {
-      pthread_barrier_wait(&pool.job_start_);
+      pool.job_start_.wait();
       if (pool.shutdown_)
         break;
       pool.task_fn_(tid, pool.num_threads_, pool.task_ctx_);
-      pthread_barrier_wait(&pool.job_end_);
+      pool.job_end_.wait();
     }
-    pthread_barrier_wait(&pool.job_end_);
+    pool.job_end_.wait();
     return nullptr;
   }
 
   int num_threads_;
   vector<pthread_t> threads_;
   vector<int> thread_ids_;
-  pthread_barrier_t job_start_;
-  pthread_barrier_t job_end_;
+  SpinBarrier job_start_;
+  SpinBarrier job_end_;
   bool shutdown_;
   void (*task_fn_)(int, int, void *);
   void *task_ctx_;
@@ -137,146 +275,121 @@ static ThreadPool &Pool() {
 }
 
 
-static void ParallelFor(int64_t begin, int64_t end,
-                        void (*body)(int64_t, void *), void *ctx) {
-  struct ParForCtx {
-    int64_t begin;
-    int64_t end;
-    void (*body)(int64_t, void *);
-    void *ctx;
-  } par_ctx = {begin, end, body, ctx};
-
-  auto worker = [](int tid, int nthreads, void *arg) {
-    ParForCtx *p = static_cast<ParForCtx *>(arg);
-    int64_t count = p->end - p->begin;
-    int64_t chunk = (count + nthreads - 1) / nthreads;
-    int64_t my_begin = p->begin + static_cast<int64_t>(tid) * chunk;
-    int64_t my_end = min(my_begin + chunk, p->end);
-    for (int64_t i = my_begin; i < my_end; i++)
-      p->body(i, p->ctx);
-  };
-
-  Pool().Run(worker, &par_ctx);
+// GOMP's default-static distribution of [0, n) across `nthreads`: the first
+// (n % nthreads) threads get ceil(n/nthreads), the rest floor(n/nthreads).
+static inline void StaticRange(int64_t n, int nthreads, int tid,
+                               int64_t *begin, int64_t *end) {
+  int64_t q = n / nthreads;
+  int64_t r = n % nthreads;
+  if (tid < r) {
+    *begin = (q + 1) * tid;
+    *end = *begin + q + 1;
+  } else {
+    *begin = q * tid + r;
+    *end = *begin + q;
+  }
 }
 
 
-struct ReduceCtx {
-  int64_t begin;
-  int64_t end;
-  int chunk;
-  atomic<int64_t> next;
-  int64_t *partials;
-  void (*body)(int64_t, int64_t *, void *);
-  void *body_ctx;
-};
-
-
-static void ParallelForReduceDynamic(int64_t begin, int64_t end, int chunk,
-                                     void (*body)(int64_t, int64_t *, void *),
-                                     void *body_ctx, int64_t *out) {
-  ThreadPool &pool = Pool();
-  vector<int64_t> partials(pool.num_threads(), 0);
-  ReduceCtx rctx;
-  rctx.begin = begin;
-  rctx.end = end;
-  rctx.chunk = chunk;
-  rctx.next.store(begin);
-  rctx.partials = partials.data();
-  rctx.body = body;
-  rctx.body_ctx = body_ctx;
-
-  auto worker = [](int tid, int nthreads, void *arg) {
-    ReduceCtx *p = static_cast<ReduceCtx *>(arg);
-    int64_t local = 0;
-    while (true) {
-      int64_t i = p->next.fetch_add(p->chunk);
-      if (i >= p->end)
-        break;
-      int64_t limit = min(i + p->chunk, p->end);
-      for (int64_t j = i; j < limit; j++)
-        p->body(j, &local, p->body_ctx);
-    }
-    p->partials[tid] = local;
-  };
-
-  pool.Run(worker, &rctx);
-
-  int64_t sum = 0;
-  for (int64_t v : partials)
-    sum += v;
-  *out = sum;
-}
-
-
+// ---------------------------------------------------------------------------
+// BUStep -- mirrors:
+//   #pragma omp parallel for reduction(+:awake_count) schedule(dynamic, 1024)
+// ---------------------------------------------------------------------------
 struct BUStepCtx {
   const Graph *g;
   pvector<NodeID> *parent;
   Bitmap *front;
   Bitmap *next;
+  atomic<int64_t> *next_index;
+  int64_t num_nodes;
+  int64_t *awake_parts;
 };
 
-
-static void BUStepBody(int64_t u, int64_t *local, void *arg) {
-  BUStepCtx *ctx = static_cast<BUStepCtx *>(arg);
-  if ((*ctx->parent)[u] < 0) {
-    for (NodeID v : ctx->g->in_neigh(u)) {
-      if (ctx->front->get_bit(v)) {
-        (*ctx->parent)[u] = v;
-        (*local)++;
-        ctx->next->set_bit(u);
-        break;
+static void BUStepWorker(int tid, int /*nthreads*/, void *arg) {
+  BUStepCtx *c = static_cast<BUStepCtx *>(arg);
+  const Graph &g = *c->g;
+  pvector<NodeID> &parent = *c->parent;
+  Bitmap &front = *c->front;
+  Bitmap &next = *c->next;
+  const int64_t kChunk = 1024;
+  int64_t awake_count = 0;
+  while (true) {
+    int64_t start = c->next_index->fetch_add(kChunk, memory_order_relaxed);
+    if (start >= c->num_nodes)
+      break;
+    int64_t stop = min(start + kChunk, c->num_nodes);
+    for (NodeID u = start; u < stop; u++) {
+      if (parent[u] < 0) {
+        for (NodeID v : g.in_neigh(u)) {
+          if (front.get_bit(v)) {
+            parent[u] = v;
+            awake_count++;
+            next.set_bit(u);
+            break;
+          }
+        }
       }
     }
   }
+  c->awake_parts[tid] = awake_count;
 }
-
 
 int64_t BUStep(const Graph &g, pvector<NodeID> &parent, Bitmap &front,
                Bitmap &next) {
   next.reset();
-  BUStepCtx ctx = {&g, &parent, &front, &next};
+  ThreadPool &pool = Pool();
+  vector<int64_t> awake_parts(pool.num_threads(), 0);
+  atomic<int64_t> next_index(0);
+  BUStepCtx ctx = {&g, &parent, &front, &next, &next_index, g.num_nodes(),
+                   awake_parts.data()};
+  pool.Run(BUStepWorker, &ctx);
   int64_t awake_count = 0;
-  ParallelForReduceDynamic(0, g.num_nodes(), 1024, BUStepBody, &ctx,
-                           &awake_count);
+  for (int64_t v : awake_parts)
+    awake_count += v;
   return awake_count;
 }
 
 
+// ---------------------------------------------------------------------------
+// TDStep -- mirrors:
+//   #pragma omp parallel { QueueBuffer lqueue;
+//     #pragma omp for reduction(+:scout_count) nowait { ... } lqueue.flush(); }
+// (default static schedule, nowait -> the pool's end barrier is the region's
+// implicit barrier).
+// ---------------------------------------------------------------------------
 struct TDStepCtx {
   const Graph *g;
   pvector<NodeID> *parent;
   SlidingQueue<NodeID> *queue;
-  int64_t *scout_count;
+  int64_t *scout_parts;
 };
 
-
 static void TDStepWorker(int tid, int nthreads, void *arg) {
-  TDStepCtx *ctx = static_cast<TDStepCtx *>(arg);
-  QueueBuffer<NodeID> lqueue(*ctx->queue);
-  auto q_begin = ctx->queue->begin();
-  auto q_end = ctx->queue->end();
-  int64_t len = q_end - q_begin;
-  int64_t chunk = (len + nthreads - 1) / nthreads;
-  auto my_begin = q_begin + static_cast<int64_t>(tid) * chunk;
-  auto my_end = min(q_begin + static_cast<int64_t>(tid + 1) * chunk, q_end);
+  TDStepCtx *c = static_cast<TDStepCtx *>(arg);
+  const Graph &g = *c->g;
+  pvector<NodeID> &parent = *c->parent;
+  QueueBuffer<NodeID> lqueue(*c->queue);
+  auto q_begin = c->queue->begin();
+  int64_t len = c->queue->end() - q_begin;
+  int64_t my_begin, my_end;
+  StaticRange(len, nthreads, tid, &my_begin, &my_end);
 
-  int64_t local_scout = 0;
-  for (auto q_iter = my_begin; q_iter < my_end; q_iter++) {
-    NodeID u = *q_iter;
-    for (NodeID v : ctx->g->out_neigh(u)) {
-      NodeID curr_val = (*ctx->parent)[v];
+  int64_t scout_count = 0;
+  for (int64_t i = my_begin; i < my_end; i++) {
+    NodeID u = *(q_begin + i);
+    for (NodeID v : g.out_neigh(u)) {
+      NodeID curr_val = parent[v];
       if (curr_val < 0) {
-        if (compare_and_swap((*ctx->parent)[v], curr_val, u)) {
+        if (compare_and_swap(parent[v], curr_val, u)) {
           lqueue.push_back(v);
-          local_scout += -curr_val;
+          scout_count += -curr_val;
         }
       }
     }
   }
   lqueue.flush();
-  ctx->scout_count[tid] = local_scout;
+  c->scout_parts[tid] = scout_count;
 }
-
 
 int64_t TDStep(const Graph &g, pvector<NodeID> &parent,
                SlidingQueue<NodeID> &queue) {
@@ -291,44 +404,56 @@ int64_t TDStep(const Graph &g, pvector<NodeID> &parent,
 }
 
 
-struct QueueIterCtx {
+// ---------------------------------------------------------------------------
+// QueueToBitmap -- mirrors: #pragma omp parallel for (default static)
+// ---------------------------------------------------------------------------
+struct QueueToBitmapCtx {
   SlidingQueue<NodeID>::iterator begin;
-  SlidingQueue<NodeID>::iterator end;
+  int64_t size;
   Bitmap *bm;
 };
 
-
-static void QueueToBitmapBody(int64_t offset, void *arg) {
-  QueueIterCtx *ctx = static_cast<QueueIterCtx *>(arg);
-  NodeID u = *(ctx->begin + offset);
-  ctx->bm->set_bit_atomic(u);
+static void QueueToBitmapWorker(int tid, int nthreads, void *arg) {
+  QueueToBitmapCtx *c = static_cast<QueueToBitmapCtx *>(arg);
+  Bitmap &bm = *c->bm;
+  int64_t my_begin, my_end;
+  StaticRange(c->size, nthreads, tid, &my_begin, &my_end);
+  for (int64_t i = my_begin; i < my_end; i++) {
+    NodeID u = *(c->begin + i);
+    bm.set_bit_atomic(u);
+  }
 }
-
 
 void QueueToBitmap(const SlidingQueue<NodeID> &queue, Bitmap &bm) {
-  QueueIterCtx ctx = {queue.begin(), queue.end(), &bm};
-  ParallelFor(0, queue.size(), QueueToBitmapBody, &ctx);
+  QueueToBitmapCtx ctx = {queue.begin(), static_cast<int64_t>(queue.size()),
+                          &bm};
+  Pool().Run(QueueToBitmapWorker, &ctx);
 }
 
 
+// ---------------------------------------------------------------------------
+// BitmapToQueue -- mirrors:
+//   #pragma omp parallel { QueueBuffer lqueue;
+//     #pragma omp for nowait { ... } lqueue.flush(); }
+// (default static schedule)
+// ---------------------------------------------------------------------------
 struct BitmapToQueueCtx {
   const Graph *g;
   Bitmap *bm;
   SlidingQueue<NodeID> *queue;
 };
 
-
 static void BitmapToQueueWorker(int tid, int nthreads, void *arg) {
-  BitmapToQueueCtx *ctx = static_cast<BitmapToQueueCtx *>(arg);
-  QueueBuffer<NodeID> lqueue(*ctx->queue);
-  NodeID n_begin = (ctx->g->num_nodes() * tid) / nthreads;
-  NodeID n_end = (ctx->g->num_nodes() * (tid + 1)) / nthreads;
-  for (NodeID n = n_begin; n < n_end; n++)
-    if (ctx->bm->get_bit(n))
+  BitmapToQueueCtx *c = static_cast<BitmapToQueueCtx *>(arg);
+  Bitmap &bm = *c->bm;
+  QueueBuffer<NodeID> lqueue(*c->queue);
+  int64_t my_begin, my_end;
+  StaticRange(c->g->num_nodes(), nthreads, tid, &my_begin, &my_end);
+  for (NodeID n = my_begin; n < my_end; n++)
+    if (bm.get_bit(n))
       lqueue.push_back(n);
   lqueue.flush();
 }
-
 
 void BitmapToQueue(const Graph &g, const Bitmap &bm,
                    SlidingQueue<NodeID> &queue) {
@@ -338,35 +463,48 @@ void BitmapToQueue(const Graph &g, const Bitmap &bm,
 }
 
 
+// ---------------------------------------------------------------------------
+// InitParent -- mirrors: #pragma omp parallel for (default static)
+// ---------------------------------------------------------------------------
 struct InitParentCtx {
   const Graph *g;
   pvector<NodeID> *parent;
 };
 
-
-static void InitParentBody(int64_t n, void *arg) {
-  InitParentCtx *ctx = static_cast<InitParentCtx *>(arg);
-  (*ctx->parent)[n] = ctx->g->out_degree(n) != 0 ? -ctx->g->out_degree(n) : -1;
+static void InitParentWorker(int tid, int nthreads, void *arg) {
+  InitParentCtx *c = static_cast<InitParentCtx *>(arg);
+  const Graph &g = *c->g;
+  pvector<NodeID> &parent = *c->parent;
+  int64_t my_begin, my_end;
+  StaticRange(g.num_nodes(), nthreads, tid, &my_begin, &my_end);
+  for (NodeID n = my_begin; n < my_end; n++)
+    parent[n] = g.out_degree(n) != 0 ? -g.out_degree(n) : -1;
 }
-
 
 pvector<NodeID> InitParent(const Graph &g) {
   pvector<NodeID> parent(g.num_nodes());
   InitParentCtx ctx = {&g, &parent};
-  ParallelFor(0, g.num_nodes(), InitParentBody, &ctx);
+  Pool().Run(InitParentWorker, &ctx);
   return parent;
 }
 
 
+// ---------------------------------------------------------------------------
+// Final cleanup sweep -- mirrors the closing #pragma omp parallel for in DOBFS.
+// ---------------------------------------------------------------------------
 struct CleanupParentCtx {
   pvector<NodeID> *parent;
+  int64_t num_nodes;
 };
 
-
-static void CleanupParentBody(int64_t n, void *arg) {
-  CleanupParentCtx *ctx = static_cast<CleanupParentCtx *>(arg);
-  if ((*ctx->parent)[n] < -1)
-    (*ctx->parent)[n] = -1;
+static void CleanupParentWorker(int tid, int nthreads, void *arg) {
+  CleanupParentCtx *c = static_cast<CleanupParentCtx *>(arg);
+  pvector<NodeID> &parent = *c->parent;
+  int64_t my_begin, my_end;
+  StaticRange(c->num_nodes, nthreads, tid, &my_begin, &my_end);
+  for (NodeID n = my_begin; n < my_end; n++)
+    if (parent[n] < -1)
+      parent[n] = -1;
 }
 
 
@@ -425,8 +563,8 @@ pvector<NodeID> DOBFS(const Graph &g, NodeID source, bool logging_enabled = fals
         PrintStep("td", t.Seconds(), queue.size());
     }
   }
-  CleanupParentCtx cleanup_ctx = {&parent};
-  ParallelFor(0, g.num_nodes(), CleanupParentBody, &cleanup_ctx);
+  CleanupParentCtx cleanup_ctx = {&parent, g.num_nodes()};
+  Pool().Run(CleanupParentWorker, &cleanup_ctx);
   return parent;
 }
 
