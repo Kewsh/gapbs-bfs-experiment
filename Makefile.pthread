@@ -1,0 +1,16 @@
+# Pthread builds for GAPBS experiment kernels (no OpenMP runtime).
+# -D_OPENMP selects real atomics in platform_atomics.h without linking libgomp.
+
+CXX ?= g++
+CXX_FLAGS = -std=c++11 -O3 -Wall -D_OPENMP -pthread
+
+HEADERS = $(wildcard src/*.h)
+
+.PHONY: all clean
+all: bfs_pthread
+
+bfs_pthread: src/bfs_pthread.cc $(HEADERS)
+	$(CXX) $(CXX_FLAGS) src/bfs_pthread.cc -o $@
+
+clean:
+	rm -f bfs_pthread pr_pthread
