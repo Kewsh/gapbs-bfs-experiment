@@ -21,3 +21,4 @@ pngpr/
 imc_bw_sampler*
 __pycache__/
 .venv/
+bfs_pthread
